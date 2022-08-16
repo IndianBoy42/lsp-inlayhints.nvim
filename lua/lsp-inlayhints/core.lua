@@ -23,25 +23,28 @@ end
 
 local function set_store(bufnr, client)
   if not store.b[bufnr].attached then
+    store.b[bufnr].client = { name = client.name, id = client.id }
+    store.b[bufnr].attached = true
+
+    -- give it some time for the server to start;
+    M.show(bufnr, 2000)
+    store.b[bufnr].first_request = true
+
     vim.api.nvim_buf_attach(bufnr, false, {
       on_detach = function()
         vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
       end,
       on_lines = function(_, _, _, first_lnum, last_lnum)
-        vim.api.nvim_buf_clear_namespace(bufnr, ns, first_lnum, last_lnum)
+        if not store.b[bufnr].attached then
+          rawset(store.b, bufnr, nil)
+          return true
+        end
+
+        local delay = vim.api.nvim_get_mode()["mode"] ~= "n" and 1250 or nil
+        M.show(bufnr, delay)
       end,
     })
   end
-
-  store.b[bufnr].client = { name = client.name, id = client.id }
-  store.b[bufnr].attached = true
-
-  if not store.active_clients[client.name] then
-    -- give it some time for the server to start;
-    M.show(bufnr, 2000)
-    store.b[bufnr].first_request = true
-  end
-  store.active_clients[client.name] = true
 end
 
 --- Setup inlayHints
@@ -79,34 +82,14 @@ function M.setup_autocmd(bufnr)
   if store.b[bufnr].aucmd then
     return
   end
-
-  local events = { "BufEnter", "BufWritePost", "CursorHold", "InsertLeave", "WinScrolled" }
-
-  local group = vim.api.nvim_create_augroup(AUGROUP, { clear = false })
-  local aucmd = vim.api.nvim_create_autocmd(events, {
-    group = group,
-    buffer = bufnr,
-    callback = function()
-      M.show(bufnr)
-    end,
-  })
-
-  local aucmd2 = vim.api.nvim_create_autocmd({ "CursorHoldI" }, {
-    group = group,
-    buffer = bufnr,
-    callback = function()
-      M.show(bufnr, 1000) -- effectively ~1250ms
-    end,
-  })
-
-  store.b[bufnr].aucmd = { aucmd, aucmd2 }
+  store.b[bufnr].aucmd = true
 
   if vim.fn.has "nvim-0.8" > 0 then
-    local group2 = vim.api.nvim_create_augroup(AUGROUP .. "Detach", { clear = false })
+    local group = vim.api.nvim_create_augroup(AUGROUP .. "Detach", { clear = false })
     -- Needs nightly!
     -- https://github.com/neovim/neovim/commit/2ffafc7aa91fb1d9a71fff12051e40961a7b7f69
     vim.api.nvim_create_autocmd("LspDetach", {
-      group = group2,
+      group = group,
       buffer = bufnr,
       once = true,
       callback = function(args)
@@ -114,15 +97,7 @@ function M.setup_autocmd(bufnr)
           return
         end
 
-        if config.options.debug_mode then
-          local msg = string.format("[LSP InlayHints] detached from %d", bufnr)
-          vim.notify(msg, vim.log.levels.TRACE)
-        end
-
-        for _, v in pairs(store.b[bufnr].aucmd) do
-          pcall(vim.api.nvim_del_autocmd, v)
-        end
-        rawset(store.b, bufnr, nil)
+        store.b[bufnr].attached = false
       end,
     })
   end
@@ -147,10 +122,10 @@ end
 
 --- Return visible range of the buffer
 -- 'mark-indexed' (1-based lines, 0-based columns)
-local function get_hint_ranges(offset_encoding)
+local function get_hint_ranges(offset_encoding, full)
   local line_count = vim.api.nvim_buf_line_count(0) -- 1-based indexing
 
-  if line_count <= 200 then
+  if full or line_count <= 200 then
     local col = col_of_row(line_count, offset_encoding)
     return {
       start = { 1, 0 },
@@ -270,6 +245,9 @@ local cts = utils.cancellationTokenSource:new()
 ---@param bufnr number | nil
 ---@param delay integer | nil additional delay in ms.
 function M.show(bufnr, delay)
+  -- TODO
+  -- a change somewhere in the buffer might cause other hints to change, we should
+  -- get range for all visible window/bufnr.
   if enabled == false then
     return
   end
@@ -304,7 +282,7 @@ function M.show(bufnr, delay)
       return
     end
 
-    local range = get_hint_ranges(client.offset_encoding)
+    local range = get_hint_ranges(client.offset_encoding, store.b[bufnr].first_request)
     local params = get_params(range, bufnr)
     if not params then
       return
